@@ -1,0 +1,29 @@
+#!/bin/bash
+
+TARGET_MAC="$1"
+CHANNEL="$2"
+IFACE="$3"
+OUTDIR="$(dirname "$0")/logs"
+CSV_REFRESH=2
+
+mkdir -p "$OUTDIR"
+
+echo "[+] Starting airodump-ng in background..."
+sudo airodump-ng --channel "$CHANNEL" --write "$OUTDIR/track" "$IFACE" >/dev/null 2>&1 &
+AIRO_PID=$!
+
+echo "[+] airodump-ng PID: $AIRO_PID"
+
+sleep 3
+
+while true; do
+    CSV=$(ls -1t "$OUTDIR"/track-*.csv 2>/dev/null | head -n 1)
+
+    if [[ -n "$CSV" ]]; then
+        ./track_device --mac "$TARGET_MAC" --csv "$CSV"
+    else
+        echo "[!] No CSV yet..."
+    fi
+
+    sleep "$CSV_REFRESH"
+done
