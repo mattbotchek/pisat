@@ -1,1 +1,7 @@
-.env
+/build/
+/cmake-build-*/
+*.cap
+*.csv
+*.pcap
+*.pcapng
+*.log

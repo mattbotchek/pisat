@@ -1,0 +1,22 @@
+[Unit]
+Description=PiSAT passive Wi-Fi monitoring service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/pisat --config /etc/pisat/pisat.conf serve
+Restart=on-failure
+RestartSec=3
+
+# Runs as root: direct pigpio uses /dev/gpiomem or /dev/mem.
+# Monitor/capture also need NET_ADMIN/NET_RAW.
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_RAWIO
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_RAWIO
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/pisat
+
+[Install]
+WantedBy=multi-user.target
