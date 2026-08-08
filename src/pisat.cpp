@@ -21,13 +21,16 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#if defined(__linux__)
 #include <pigpio.h>
+#endif
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>
+#include "sx126x.h"
 #endif
 
 #include <openssl/evp.h>
@@ -1150,24 +1153,9 @@ bool LoRaServer::write_frame(const std::string& frame) {
     (void)frame;
     return false;
 #else
-    if (descriptor_ < 0 || frame.size() + 1 > static_cast<std::size_t>(max_frame_bytes_))
+    if (!sx126x_ || !sx126x_->isReady() || frame.size() + 1 > static_cast<std::size_t>(max_frame_bytes_))
         return false;
-    std::string ready_error;
-    if (!wait_hat_ready(ready_error)) return false;
-    const std::string wire = frame + "\n";
-    std::size_t sent = 0;
-    while (sent < wire.size()) {
-        const auto count = write(static_cast<int>(descriptor_), wire.data() + sent,
-                                 wire.size() - sent);
-        if (count > 0) {
-            sent += static_cast<std::size_t>(count);
-        } else if (errno != EAGAIN && errno != EINTR) {
-            return false;
-        } else {
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        }
-    }
-    return true;
+    return sx126x_->send(frame + "\n");
 #endif
 }
 
@@ -1176,37 +1164,13 @@ bool LoRaServer::initialize_hat(std::string& error) {
     error = "pigpio HAT control is supported on Linux only";
     return false;
 #else
-    const auto internals = gpioCfgGetInternals() | PI_CFG_NOSIGHANDLER;
-    if (gpioCfgSetInternals(internals) < 0 ||
-        gpioCfgInterfaces(PI_DISABLE_FIFO_IF | PI_DISABLE_SOCK_IF) < 0) {
-        error = "failed to configure pigpio internals";
+    sx126x_ = std::make_unique<SX126X>(device_, baud_, m0_gpio_, m1_gpio_, aux_gpio_, aux_active_high_);
+    if (!sx126x_ || !sx126x_->isReady()) {
+        error = "failed to initialize SX126x HAT";
+        sx126x_.reset();
         return false;
     }
-    if (gpioInitialise() < 0) {
-        error = "pigpio initialization failed";
-        return false;
-    }
-    pigpio_initialized_ = true;
-    if (gpioWrite(static_cast<unsigned>(m0_gpio_), 0) < 0 ||
-        gpioWrite(static_cast<unsigned>(m1_gpio_), 0) < 0 ||
-        gpioSetMode(static_cast<unsigned>(m0_gpio_), PI_OUTPUT) < 0 ||
-        gpioSetMode(static_cast<unsigned>(m1_gpio_), PI_OUTPUT) < 0 ||
-        gpioSetMode(static_cast<unsigned>(aux_gpio_), PI_INPUT) < 0 ||
-        gpioSetPullUpDown(static_cast<unsigned>(aux_gpio_),
-                         aux_active_high_ ? PI_PUD_DOWN : PI_PUD_UP) < 0) {
-        error = "failed to configure SX126x GPIO directions";
-        shutdown_hat();
-        return false;
-    }
-    const auto [m0, m1] = sx126x_mode_levels("normal");
-    if (gpioWrite(static_cast<unsigned>(m0_gpio_), static_cast<unsigned>(m0)) < 0 ||
-        gpioWrite(static_cast<unsigned>(m1_gpio_), static_cast<unsigned>(m1)) < 0) {
-        error = "failed to place SX126x HAT in normal mode";
-        shutdown_hat();
-        return false;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    return wait_hat_ready(error);
+    return true;
 #endif
 }
 
@@ -1215,32 +1179,18 @@ bool LoRaServer::wait_hat_ready(std::string& error) const {
     error = "pigpio HAT control is supported on Linux only";
     return false;
 #else
-    if (!pigpio_initialized_) {
-        error = "pigpio is not initialized";
+    if (!sx126x_ || !sx126x_->isReady()) {
+        error = "SX126x is not initialized";
         return false;
     }
-    const int ready_level = aux_active_high_ ? 1 : 0;
-    const auto deadline = std::chrono::steady_clock::now() +
-                          std::chrono::milliseconds(aux_timeout_ms_);
-    while (std::chrono::steady_clock::now() < deadline) {
-        const int level = gpioRead(static_cast<unsigned>(aux_gpio_));
-        if (level == ready_level) return true;
-        if (level < 0) {
-            error = "failed to read SX126x AUX GPIO";
-            return false;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
-    }
-    error = "timed out waiting for SX126x AUX ready";
-    return false;
+    return true;
 #endif
 }
 
 void LoRaServer::shutdown_hat() {
 #ifndef _WIN32
-    if (pigpio_initialized_) gpioTerminate();
+    sx126x_.reset();
 #endif
-    pigpio_initialized_ = false;
 }
 
 std::uint64_t LoRaServer::next_outbound_nonce() {
@@ -1269,44 +1219,6 @@ bool LoRaServer::run(std::string& error) {
     return false;
 #else
     if (!initialize_hat(error)) return false;
-    const auto speed = serial_speed(baud_);
-    if (speed == 0) {
-        error = "unsupported lora_baud";
-        shutdown_hat();
-        return false;
-    }
-    descriptor_ = open(device_.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK);
-    if (descriptor_ < 0) {
-        error = "cannot open LoRa device " + device_ + ": " + std::strerror(errno);
-        shutdown_hat();
-        return false;
-    }
-    termios options{};
-    if (tcgetattr(static_cast<int>(descriptor_), &options) != 0) {
-        error = "cannot read LoRa serial settings: " + std::string(std::strerror(errno));
-        stop();
-        shutdown_hat();
-        return false;
-    }
-    options.c_iflag &= ~(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL | IXON);
-    options.c_oflag &= ~OPOST;
-    options.c_lflag &= ~(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
-    options.c_cflag &= ~(CSIZE | PARENB);
-    options.c_cflag |= CS8;
-    cfsetispeed(&options, speed);
-    cfsetospeed(&options, speed);
-    options.c_cflag |= CLOCAL | CREAD;
-    options.c_cflag &= ~CSTOPB;
-#ifdef CRTSCTS
-    options.c_cflag &= ~CRTSCTS;
-#endif
-    if (tcsetattr(static_cast<int>(descriptor_), TCSANOW, &options) != 0) {
-        error = "cannot configure LoRa serial device: " + std::string(std::strerror(errno));
-        stop();
-        shutdown_hat();
-        return false;
-    }
-    tcflush(static_cast<int>(descriptor_), TCIOFLUSH);
     {
         std::error_code state_error;
         const bool inbound_exists = fs::exists(nonce_file_, state_error);
@@ -1369,11 +1281,15 @@ bool LoRaServer::run(std::string& error) {
     std::string input;
     auto next_publish = std::chrono::steady_clock::now() +
                         std::chrono::seconds(publish_interval_seconds_);
-    std::array<char, 256> buffer{};
+    std::array<uint8_t, 256> buffer{};
     while (!stop_requested_) {
-        const auto count = read(static_cast<int>(descriptor_), buffer.data(), buffer.size());
+        int count = 0;
+        if (sx126x_->available()) {
+            count = sx126x_->receive(buffer.data(), static_cast<int>(buffer.size()));
+        }
         if (count > 0) {
-            input.append(buffer.data(), static_cast<std::size_t>(count));
+            input.append(reinterpret_cast<const char*>(buffer.data()),
+                         static_cast<std::size_t>(count));
             if (input.size() > static_cast<std::size_t>(max_frame_bytes_) * 2) input.clear();
             std::size_t newline = 0;
             while ((newline = input.find('\n')) != std::string::npos) {
@@ -1428,8 +1344,8 @@ bool LoRaServer::run(std::string& error) {
             }
         } else if (count < 0 && stop_requested_) {
             break;
-        } else if (count < 0 && errno != EAGAIN && errno != EINTR) {
-            error = "LoRa serial read failed: " + std::string(std::strerror(errno));
+        } else if (count < 0) {
+            error = "LoRa serial read failed";
             stop();
             shutdown_hat();
             return false;
@@ -1454,10 +1370,6 @@ bool LoRaServer::run(std::string& error) {
 
 void LoRaServer::stop() {
     stop_requested_ = true;
-#ifndef _WIN32
-    if (descriptor_ >= 0) close(static_cast<int>(descriptor_));
-#endif
-    descriptor_ = -1;
 }
 
 } // namespace pisat

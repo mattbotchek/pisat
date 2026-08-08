@@ -9,6 +9,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 add_library(pisat_core
     src/pisat.cpp
+    src/sx126x.cpp
 )
 target_include_directories(pisat_core PUBLIC include)
 target_compile_options(pisat_core PRIVATE
@@ -16,7 +17,7 @@ target_compile_options(pisat_core PRIVATE
     $<$<CXX_COMPILER_ID:MSVC>:/W4>
 )
 
-if(UNIX)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     find_package(Threads REQUIRED)
     find_package(OpenSSL REQUIRED)
     find_path(PIGPIO_INCLUDE_DIR pigpio.h REQUIRED)

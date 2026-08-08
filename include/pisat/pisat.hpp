@@ -5,12 +5,15 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
 #include <utility>
 #include <vector>
+
+class SX126X;
 
 namespace pisat {
 
@@ -233,8 +236,7 @@ private:
     Handler handler_;
     Publisher publisher_;
     std::atomic<bool> stop_requested_{false};
-    long descriptor_ = -1;
-    bool pigpio_initialized_ = false;
+    std::unique_ptr<::SX126X> sx126x_;
     std::map<std::string, std::uint64_t> last_nonces_;
     std::uint64_t outbound_nonce_ = 0;
 };
