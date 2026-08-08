@@ -16,36 +16,69 @@
 SX126X::SX126X(const std::string &serialDev, int baud)
     : fd(-1), pigpioReady(false), m0_gpio_(22), m1_gpio_(27), aux_gpio_(17), aux_active_high_(true)
 {
-    // Delegate to full init path by reusing logic below
+    // Configure pigpio internals and interfaces
     const uint32_t internalFlags = gpioCfgGetInternals();
     if (gpioCfgSetInternals(internalFlags | PI_CFG_NOSIGHANDLER) < 0 ||
         gpioCfgInterfaces(PI_DISABLE_FIFO_IF | PI_DISABLE_SOCK_IF) < 0) {
         std::cerr << "pigpio configuration failed\n";
         return;
     }
+
+    // Try to initialize pigpio; if a stale pid exists try removing it and retry once
     if (gpioInitialise() < 0) {
-        std::cerr << "pigpio init failed\n";
-        return;
+        // best-effort remove stale pid file
+        if (std::FILE* f = std::fopen("/run/pigpio.pid", "r")) {
+            std::fclose(f);
+            std::remove("/run/pigpio.pid");
+        }
+        if (gpioInitialise() < 0) {
+            std::cerr << "pigpio init failed\n";
+            return;
+        }
     }
     pigpioReady = true;
 
-    // Set output latches low before enabling output mode to avoid a mode-select glitch.
-    if (gpioWrite(m0_gpio_, 0) < 0 || gpioWrite(m1_gpio_, 0) < 0 ||
-        gpioSetMode(m0_gpio_, PI_OUTPUT) < 0 || gpioSetMode(m1_gpio_, PI_OUTPUT) < 0 ||
-        gpioSetMode(aux_gpio_, PI_INPUT) < 0 || gpioSetPullUpDown(aux_gpio_, PI_PUD_UP) < 0) {
-        std::cerr << "LoRa GPIO setup failed\n";
-        gpioTerminate();
-        pigpioReady = false;
-        return;
+    // Ensure mode pins are outputs before driving them to avoid transient glitches
+    const int max_attempts = 3;
+    bool gpio_ok = false;
+    for (int attempt = 0; attempt < max_attempts; ++attempt) {
+        if (gpioSetMode(m0_gpio_, PI_OUTPUT) < 0 || gpioSetMode(m1_gpio_, PI_OUTPUT) < 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            continue;
+        }
+        if (gpioWrite(m0_gpio_, 0) < 0 || gpioWrite(m1_gpio_, 0) < 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            continue;
+        }
+        if (gpioSetMode(aux_gpio_, PI_INPUT) < 0 || gpioSetPullUpDown(aux_gpio_, PI_PUD_UP) < 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            continue;
+        }
+        gpio_ok = true;
+        break;
     }
-    if (!waitForAux(1000)) {
-        std::cerr << "LoRa AUX not ready\n";
+    if (!gpio_ok) {
+        std::cerr << "LoRa GPIO setup failed after retries\n";
         gpioTerminate();
         pigpioReady = false;
         return;
     }
 
-    fd = serOpen(const_cast<char*>(serialDev.c_str()), baud, 0);
+    // Wait for AUX ready with a slightly extended timeout and report value on failure
+    if (!waitForAux(2000)) {
+        int aux = gpioRead(aux_gpio_);
+        std::cerr << "LoRa AUX not ready (read=" << aux << ")\n";
+        gpioTerminate();
+        pigpioReady = false;
+        return;
+    }
+
+    // Open UART with a small retry loop
+    fd = -1;
+    for (int i = 0; i < 3 && fd < 0; ++i) {
+        fd = serOpen(const_cast<char*>(serialDev.c_str()), baud, 0);
+        if (fd < 0) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
     if (fd < 0) {
         std::cerr << "UART open failed\n";
         gpioTerminate();
@@ -64,29 +97,59 @@ SX126X::SX126X(const std::string &serialDev, int baud,
         std::cerr << "pigpio configuration failed\n";
         return;
     }
+
+    // Try initialize pigpio and remove stale pid if necessary
     if (gpioInitialise() < 0) {
-        std::cerr << "pigpio init failed\n";
-        return;
+        if (std::FILE* f = std::fopen("/run/pigpio.pid", "r")) {
+            std::fclose(f);
+            std::remove("/run/pigpio.pid");
+        }
+        if (gpioInitialise() < 0) {
+            std::cerr << "pigpio init failed\n";
+            return;
+        }
     }
     pigpioReady = true;
 
-    // Set output latches low before enabling output mode to avoid a mode-select glitch.
-    if (gpioWrite(m0_gpio_, 0) < 0 || gpioWrite(m1_gpio_, 0) < 0 ||
-        gpioSetMode(m0_gpio_, PI_OUTPUT) < 0 || gpioSetMode(m1_gpio_, PI_OUTPUT) < 0 ||
-        gpioSetMode(aux_gpio_, PI_INPUT) < 0 || gpioSetPullUpDown(aux_gpio_, PI_PUD_UP) < 0) {
-        std::cerr << "LoRa GPIO setup failed\n";
-        gpioTerminate();
-        pigpioReady = false;
-        return;
+    // Ensure mode pins are outputs and driven low before using serial
+    const int max_attempts = 3;
+    bool gpio_ok = false;
+    for (int attempt = 0; attempt < max_attempts; ++attempt) {
+        if (gpioSetMode(m0_gpio_, PI_OUTPUT) < 0 || gpioSetMode(m1_gpio_, PI_OUTPUT) < 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            continue;
+        }
+        if (gpioWrite(m0_gpio_, 0) < 0 || gpioWrite(m1_gpio_, 0) < 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            continue;
+        }
+        if (gpioSetMode(aux_gpio_, PI_INPUT) < 0 || gpioSetPullUpDown(aux_gpio_, PI_PUD_UP) < 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            continue;
+        }
+        gpio_ok = true;
+        break;
     }
-    if (!waitForAux(1000)) {
-        std::cerr << "LoRa AUX not ready\n";
+    if (!gpio_ok) {
+        std::cerr << "LoRa GPIO setup failed after retries\n";
         gpioTerminate();
         pigpioReady = false;
         return;
     }
 
-    fd = serOpen(const_cast<char*>(serialDev.c_str()), baud, 0);
+    if (!waitForAux(2000)) {
+        int aux = gpioRead(aux_gpio_);
+        std::cerr << "LoRa AUX not ready (read=" << aux << ")\n";
+        gpioTerminate();
+        pigpioReady = false;
+        return;
+    }
+
+    fd = -1;
+    for (int i = 0; i < 3 && fd < 0; ++i) {
+        fd = serOpen(const_cast<char*>(serialDev.c_str()), baud, 0);
+        if (fd < 0) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
     if (fd < 0) {
         std::cerr << "UART open failed\n";
         gpioTerminate();

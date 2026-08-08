@@ -35,6 +35,7 @@
 
 #include <openssl/evp.h>
 #include <openssl/rand.h>
+#include <iostream>
 
 namespace fs = std::filesystem;
 
@@ -1297,11 +1298,35 @@ bool LoRaServer::run(std::string& error) {
                 input.erase(0, newline + 1);
                 if (frame.empty() || frame.size() > static_cast<std::size_t>(max_frame_bytes_))
                     continue;
+                // Many HATs/drivers may produce noise or binary preamble; extract the first occurrence
+                // of the secure frame prefix "P2|" and discard anything before it.
+                auto p2pos = frame.find("P2|");
+                if (p2pos == std::string::npos) {
+                    // not a secure frame, log a short hex preview for diagnostics and skip
+                    std::ostringstream hex;
+                    for (size_t i = 0; i < frame.size() && i < 32; ++i) {
+                        unsigned char c = static_cast<unsigned char>(frame[i]);
+                        hex << std::hex << std::setw(2) << std::setfill('0') << (int)c << " ";
+                    }
+                    std::cerr << "Non-P2 serial data (skipping), hex=" << hex.str() << " len=" << frame.size() << "\n";
+                    continue;
+                }
+                if (p2pos > 0) frame = frame.substr(p2pos);
                 std::string parse_error;
                 const auto previous_nonces = last_nonces_;
                 const auto request =
                     parse_secure_lora_frame(frame, node_id_, key_, last_nonces_, parse_error);
-                if (!request) continue;
+                if (!request) {
+                    std::cerr << "LoRa parse failed: " << parse_error << " frame=\"" << frame << "\"\n";
+                    // log hex of the frame for debugging
+                    std::ostringstream hex;
+                    for (size_t i = 0; i < frame.size() && i < 128; ++i) {
+                        unsigned char c = static_cast<unsigned char>(frame[i]);
+                        hex << std::hex << std::setw(2) << std::setfill('0') << (int)c << " ";
+                    }
+                    std::cerr << "frame hex=" << hex.str() << "\n";
+                    continue;
+                }
                 bool nonce_persisted = false;
                 {
                     const auto temporary = nonce_file_ + ".tmp";

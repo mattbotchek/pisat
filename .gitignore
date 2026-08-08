@@ -5,3 +5,10 @@
 *.pcap
 *.pcapng
 *.log
+
+# macOS AppleDouble metadata
+._*
+.DS_Store
+
+# local config may contain a real lora_key - keep it out of the repo
+config/pisat.conf
