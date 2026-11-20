@@ -1,3 +1,5 @@
+Created by Matthew Botchek, collaborative effort with Marc Aldrich Brophy
+
 # PiSAT
 
 PiSAT is a C++20/CMake service for **passive, authorized** Wi-Fi observation on a
